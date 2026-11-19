@@ -13,7 +13,7 @@ venv\Scripts\activate          # Windows
 pip install -r requirements.txt
 ```
 
-Dependencias: `requests` (peticiones HTTP), `lxml` (parseo HTML y XPath) y `boto3[crt]` (subida a S3; el extra `crt` es necesario si las credenciales se obtienen con `aws login`).
+Dependencias principales: `requests` (peticiones HTTP), `lxml` (parseo HTML y XPath), `boto3[crt]` (subida a S3; el extra `crt` es necesario si las credenciales se obtienen con `aws login`), `pymupdf4llm` + `rapidocr` + `onnxruntime` (PDF → Markdown con OCR) y `langchain-aws` (extracción con un LLM en Bedrock).
 
 ### Credenciales de AWS
 
@@ -85,7 +85,35 @@ Cada ejecución guarda los documentos en una carpeta con la fecha (`AAAAMMDD`), 
 - Sin ficha publicada en la web: Latam, Solidario y Bonos Institucional I–V.
 - `Otros` y `SICAV Luxemburguesas` son páginas que agrupan varios productos y no tienen estos documentos.
 
+## Etapa 2: transformación de PDF a Markdown
+
+Script: [`structured_output/pdf_a_markdown.py`](structured_output/pdf_a_markdown.py)
+
+Convierte los PDF a Markdown con [PyMuPDF](https://pymupdf.readthedocs.io/) (`pymupdf4llm`), que conserva títulos, listas y **tablas** (las de costes y rentabilidades salen como tablas Markdown) y aplica **OCR** con RapidOCR en las páginas que lo necesitan. RapidOCR se instala con `pip` y no requiere nada más en el sistema; si no está, `pymupdf4llm` usa Tesseract si lo encuentra instalado.
+
+```bash
+python structured_output/pdf_a_markdown.py                      # todos los PDF de descargas/bestinver
+python structured_output/pdf_a_markdown.py ruta/fichero.pdf     # uno o varios ficheros o carpetas
+python structured_output/pdf_a_markdown.py --salida markdown/   # carpeta de salida (por defecto, junto a cada PDF)
+python structured_output/pdf_a_markdown.py --ocr siempre        # auto (por defecto) | siempre | nunca
+python structured_output/pdf_a_markdown.py --sobrescribir       # regenera los .md que ya existan
+```
+
+Cada `<slug>_<tipo>.pdf` genera un `<slug>_<tipo>.md`. Termina con un resumen de convertidos, omitidos y fallos. El OCR tarda unos segundos por página.
+
+## Etapa 3: extracción de datos del KID
+
+Script: [`structured_output/ejemplo_kid.py`](structured_output/ejemplo_kid.py)
+
+Lee el Markdown de un KID (generado en la etapa 2) y extrae con un LLM en Amazon Bedrock (salida estructurada con Pydantic) el ISIN, nombre, gestora, SRI, periodo de mantenimiento y costes, cada uno con su **evidencia** literal. Después comprueba que cada evidencia aparece en el documento (ignorando la marca Markdown y los espacios).
+
+```bash
+python structured_output/ejemplo_kid.py                                  # KID de Bestinfond
+python structured_output/ejemplo_kid.py descargas/bestinver/bestinver-renta_datos_fundamentales.md
+```
+
 ## Próximas etapas
 
-- [ ] Extraer información de los KID descargados (PDF → datos estructurados).
+- [x] Extraer información de los KID descargados (PDF → Markdown → datos estructurados).
+- [ ] Leer los PDF de S3 y guardar los Markdown y los datos extraídos.
 - [ ] Añadir otras gestoras.
