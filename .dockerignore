@@ -1,0 +1,9 @@
+# El contexto de build es la raíz del repo: solo hace falta el código de las etapas
+venv/
+.venv/
+.git/
+.github/
+descargas/
+**/__pycache__/
+**/*.pyc
+.env

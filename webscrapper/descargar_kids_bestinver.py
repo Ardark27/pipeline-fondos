@@ -8,7 +8,7 @@ Flujo:
   2. Entra en la página de cada fondo y lee la lista de documentos
      (XPath /html/body/div[1]/div/main/section[4]/div[1]/div[2]/ul).
   3. Descarga los documentos cuyo texto coincide con los buscados y los sube
-     a s3://<bucket>/<prefijo>/<AAAAMMDD>/<slug>_<tipo>.pdf.
+     a s3://<bucket>/download/<prefijo>/<AAAAMMDD>/<slug>_<tipo>.pdf.
 
 Las credenciales de AWS se toman de la configuración estándar
 (aws configure / aws login, variables de entorno o perfil con AWS_PROFILE).
@@ -21,20 +21,22 @@ Uso:
 
 import argparse
 import re
+import sys
 import time
 import unicodedata
-from datetime import date, datetime
+from datetime import date
+from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
-import boto3
 import requests
 from botocore.exceptions import BotoCoreError, ClientError
 from lxml import html
 
-BASE_URL = "https://www.bestinver.es/fondos-de-inversion/"
+# Raíz del repo en el path para poder importar el paquete común al ejecutar el script directamente
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from common import almacenamiento_s3 as alm  # noqa: E402
 
-BUCKET_POR_DEFECTO = "curso-miax-pipeline-fondos"
-PREFIJO_POR_DEFECTO = "bestinver"
+BASE_URL = "https://www.bestinver.es/fondos-de-inversion/"
 
 XPATH_LISTA_FONDOS = "/html/body/div[1]/footer/div[2]/div/div[1]/div/ul"
 XPATH_LISTA_DOCUMENTOS = "/html/body/div[1]/div/main/section[4]/div[1]/div[2]/ul"
@@ -119,43 +121,21 @@ def descargar(session: requests.Session, url: str) -> bytes:
     return resp.content
 
 
-def subir_s3(s3, bucket: str, clave: str, contenido: bytes, url_origen: str) -> None:
-    s3.put_object(
-        Bucket=bucket,
-        Key=clave,
-        Body=contenido,
-        ContentType="application/pdf",
-        Metadata={"url-origen": url_origen},
-    )
+def descargar_documentos(
+    bucket: str = alm.BUCKET_POR_DEFECTO,
+    prefijo: str = alm.PREFIJO_POR_DEFECTO,
+    fecha: str | None = None,
+    delay: float = 1.0,
+) -> dict:
+    """Descarga los documentos de todos los fondos y los sube a S3.
 
-
-def fecha_valida(texto: str) -> str:
-    """Valida el formato AAAAMMDD para argparse."""
-    try:
-        datetime.strptime(texto, "%Y%m%d")
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"fecha no válida '{texto}', formato AAAAMMDD")
-    return texto
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--bucket", default=BUCKET_POR_DEFECTO, help="Bucket de S3 de destino")
-    parser.add_argument("--prefijo", default=PREFIJO_POR_DEFECTO, help="Carpeta raíz dentro del bucket")
-    parser.add_argument(
-        "--fecha", type=fecha_valida, default=date.today().strftime("%Y%m%d"),
-        help="Subcarpeta de fecha AAAAMMDD (por defecto, hoy)",
-    )
-    parser.add_argument("--delay", type=float, default=1.0, help="Segundos de espera entre peticiones")
-    args = parser.parse_args()
-
-    carpeta_s3 = f"{args.prefijo.strip('/')}/{args.fecha}"
-    s3 = boto3.client("s3")
-    try:
-        s3.head_bucket(Bucket=args.bucket)
-    except (BotoCoreError, ClientError) as e:
-        raise SystemExit(f"[error] no se puede acceder al bucket '{args.bucket}': {e}")
-    print(f"Destino: s3://{args.bucket}/{carpeta_s3}/\n")
+    `fecha` (AAAAMMDD) es la subcarpeta de destino; por defecto, hoy.
+    Devuelve un resumen con la carpeta de destino, las claves subidas y los fallos.
+    """
+    fecha = alm.comprobar_fecha(fecha) if fecha else date.today().strftime("%Y%m%d")
+    carpeta_s3 = alm.carpeta(alm.CARPETA_DESCARGA, prefijo, fecha)
+    s3 = alm.conectar(bucket)
+    print(f"Destino: s3://{bucket}/{carpeta_s3}/\n")
 
     session = requests.Session()
     session.headers.update(HEADERS)
@@ -163,16 +143,16 @@ def main() -> None:
     fondos = obtener_fondos(session)
     print(f"Encontrados {len(fondos)} fondos.\n")
 
-    total, fallos = 0, []
+    subidos, fallos = [], []
     for nombre, url in fondos:
         slug = [p for p in urlparse(url).path.split("/") if p][-1]
         print(f"- {nombre} ({url})")
-        time.sleep(args.delay)
+        time.sleep(delay)
         try:
             docs = obtener_documentos(session, url)
         except requests.RequestException as e:
             print(f"    [error] no se pudo abrir la página: {e}")
-            fallos.append((nombre, "página"))
+            fallos.append({"fondo": nombre, "detalle": "página"})
             continue
 
         for sufijo in DOCUMENTOS_OBJETIVO.values():
@@ -181,26 +161,46 @@ def main() -> None:
                 continue
             clave = f"{carpeta_s3}/{slug}_{sufijo}.pdf"
             try:
-                time.sleep(args.delay)
+                time.sleep(delay)
                 contenido = descargar(session, docs[sufijo])
             except requests.RequestException as e:
                 print(f"    [error] descarga {sufijo}: {e}")
-                fallos.append((nombre, f"{sufijo} (descarga)"))
+                fallos.append({"fondo": nombre, "detalle": f"{sufijo} (descarga)"})
                 continue
             try:
-                subir_s3(s3, args.bucket, clave, contenido, docs[sufijo])
-                print(f"    [ok] s3://{args.bucket}/{clave}")
-                total += 1
+                alm.escribir(s3, bucket, clave, contenido, "application/pdf", {"url-origen": docs[sufijo]})
+                print(f"    [ok] s3://{bucket}/{clave}")
+                subidos.append(clave)
             except (BotoCoreError, ClientError) as e:
                 print(f"    [error] subida {sufijo}: {e}")
-                fallos.append((nombre, f"{sufijo} (subida S3)"))
+                fallos.append({"fondo": nombre, "detalle": f"{sufijo} (subida S3)"})
 
-    print(f"\nSubidos {total} documentos a 's3://{args.bucket}/{carpeta_s3}/'.")
+    print(f"\nSubidos {len(subidos)} documentos a 's3://{bucket}/{carpeta_s3}/'.")
     if fallos:
         print(f"Fallos ({len(fallos)}):")
-        for nombre, que in fallos:
-            print(f"  - {nombre}: {que}")
+        for fallo in fallos:
+            print(f"  - {fallo['fondo']}: {fallo['detalle']}")
+    return {"bucket": bucket, "carpeta": carpeta_s3, "fecha": fecha, "subidos": subidos, "fallos": fallos}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--bucket", default=alm.BUCKET_POR_DEFECTO, help="Bucket de S3 de destino")
+    parser.add_argument("--prefijo", default=alm.PREFIJO_POR_DEFECTO, help="Gestora (carpeta dentro de download/)")
+    parser.add_argument(
+        "--fecha", type=alm.fecha_valida, default=date.today().strftime("%Y%m%d"),
+        help="Subcarpeta de fecha AAAAMMDD (por defecto, hoy)",
+    )
+    parser.add_argument("--delay", type=float, default=1.0, help="Segundos de espera entre peticiones")
+    args = parser.parse_args()
+
+    try:
+        resumen = descargar_documentos(args.bucket, args.prefijo, args.fecha, args.delay)
+    except alm.ErrorEtapa as e:
+        print(f"[error] {e}")
+        return 1
+    return 1 if resumen["fallos"] else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
