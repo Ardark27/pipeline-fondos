@@ -9,6 +9,7 @@ Uso:
     python extractor_kid.py bestinver-renta bestvalue     # KID de esos fondos (slugs)
     python extractor_kid.py --todos                       # todos los KID de la carpeta
     python extractor_kid.py --fecha 20261119              # una fecha concreta
+    python extractor_kid.py --claves markdown/bestinver/20261119/bestinfond_datos_fundamentales.md
 """
 
 import argparse
@@ -132,13 +133,19 @@ def extraer_kids(
     fecha: str | None = None,
     fondos: list[str] | None = None,
     todos: bool = False,
+    claves: list[str] | None = None,
 ) -> dict:
     """Extrae los datos de los KID en Markdown de markdown/<prefijo>/<fecha>/ y sube los JSON a extraction/.
 
     `fecha` por defecto es la más reciente en markdown/. Se procesan los KID de los `fondos`
-    indicados (slugs; por defecto bestinfond) o, con `todos`, todos los de la carpeta.
-    Devuelve un resumen con los JSON subidos y los fallos.
+    indicados (slugs; por defecto bestinfond), con `todos` todos los de la carpeta o, con
+    `claves`, los KID de esa lista de claves de S3 (la salida de la etapa 2; los .md que no son
+    KID, como las fichas, se ignoran). `claves` no se puede combinar con `fondos` ni `todos`.
+    Devuelve un resumen con los JSON subidos (`claves`) y los fallos.
     """
+    if claves is not None and (fondos or todos):
+        raise ValueError("indica 'claves' o 'fondos'/'todos', no los dos")
+
     s3 = alm.conectar(bucket)
     fecha = alm.resolver_fecha(s3, bucket, alm.CARPETA_MARKDOWN, prefijo, fecha)
     origen = alm.carpeta(alm.CARPETA_MARKDOWN, prefijo, fecha)
@@ -146,12 +153,21 @@ def extraer_kids(
     print(f"Origen:  s3://{bucket}/{origen}/")
     print(f"Destino: s3://{bucket}/{destino}/\n")
 
-    if todos:
-        claves = [c for c in alm.listar_claves(s3, bucket, origen, ".md")
-                  if PurePosixPath(c).stem.endswith(f"_{TIPO_KID}")]
+    if claves is not None:
+        claves_md = []
+        for clave in claves:
+            ruta = PurePosixPath(clave)
+            if str(ruta.parent) != origen:
+                print(f"AVISO: '{clave}' no está en s3://{bucket}/{origen}/, se ignora")
+            elif ruta.suffix == ".md" and ruta.stem.endswith(f"_{TIPO_KID}"):
+                claves_md.append(clave)
+        print(f"{len(claves_md)} KID entre las {len(claves)} claves recibidas.\n")
+    elif todos:
+        claves_md = [c for c in alm.listar_claves(s3, bucket, origen, ".md")
+                     if PurePosixPath(c).stem.endswith(f"_{TIPO_KID}")]
     else:
-        claves = [f"{origen}/{slug}_{TIPO_KID}.md" for slug in (fondos or ["bestinfond"])]
-    if not claves:
+        claves_md = [f"{origen}/{slug}_{TIPO_KID}.md" for slug in (fondos or ["bestinfond"])]
+    if not claves_md:
         raise alm.ErrorEtapa(
             f"no se ha encontrado ningún KID en Markdown en s3://{bucket}/{origen}/. "
             "Genéralo antes con: python pdf_markdown/pdf_a_markdown.py"
@@ -161,10 +177,10 @@ def extraer_kids(
     model_with_structure = model.with_structured_output(DatosKID, method="json_schema")
 
     extraidos, fallos = [], []
-    for i, clave_md in enumerate(claves, 1):
+    for i, clave_md in enumerate(claves_md, 1):
         nombre = PurePosixPath(clave_md).name
         clave_json = f"{destino}/{PurePosixPath(clave_md).stem}.json"
-        print(f"[{i}/{len(claves)}] {nombre} -> s3://{bucket}/{clave_json}")
+        print(f"[{i}/{len(claves_md)}] {nombre} -> s3://{bucket}/{clave_json}")
         try:
             if not alm.existe(s3, bucket, clave_md):
                 raise FileNotFoundError(f"no existe s3://{bucket}/{clave_md}")
@@ -197,15 +213,19 @@ def extraer_kids(
     for fallo in fallos:
         print(f"    - {fallo['fichero']}: {fallo['error']}")
     return {
-        "bucket": bucket, "origen": origen, "destino": destino, "fecha": fecha,
-        "extraidos": extraidos, "fallos": fallos,
+        "bucket": bucket, "prefijo": prefijo, "fecha": fecha, "origen": origen, "destino": destino,
+        "claves": extraidos, "fallos": fallos,
     }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("fondos", nargs="*", default=["bestinfond"], help="Slugs de los fondos (por defecto bestinfond)")
+    parser.add_argument("fondos", nargs="*", help="Slugs de los fondos (por defecto bestinfond)")
     parser.add_argument("--todos", action="store_true", help="Procesa todos los KID de la carpeta")
+    parser.add_argument(
+        "--claves", nargs="+",
+        help="Claves de S3 de los Markdown a procesar (solo se usan los KID)",
+    )
     parser.add_argument("--bucket", default=alm.BUCKET_POR_DEFECTO, help="Bucket de S3")
     parser.add_argument("--prefijo", default=alm.PREFIJO_POR_DEFECTO, help="Gestora (carpeta dentro de cada etapa)")
     parser.add_argument(
@@ -213,9 +233,11 @@ def main() -> int:
         help="Carpeta de fecha AAAAMMDD (por defecto, la más reciente en markdown/)",
     )
     args = parser.parse_args()
+    if args.claves and (args.fondos or args.todos):
+        parser.error("indica --claves o fondos/--todos, no los dos")
 
     try:
-        resumen = extraer_kids(args.bucket, args.prefijo, args.fecha, args.fondos, args.todos)
+        resumen = extraer_kids(args.bucket, args.prefijo, args.fecha, args.fondos, args.todos, args.claves)
     except alm.ErrorEtapa as e:
         print(f"[error] {e}")
         return 1

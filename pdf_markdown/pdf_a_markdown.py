@@ -10,6 +10,7 @@ Uso:
     python pdf_a_markdown.py                          # última fecha descargada de bestinver
     python pdf_a_markdown.py --fecha 20261119         # una fecha concreta
     python pdf_a_markdown.py bestinfond_datos_fundamentales.pdf   # solo esos ficheros
+    python pdf_a_markdown.py --claves download/bestinver/20261119/bestinfond_datos_fundamentales.pdf
     python pdf_a_markdown.py --ocr siempre            # fuerza el OCR en todas las páginas
     python pdf_a_markdown.py --sobrescribir           # regenera los .md que ya existan
 """
@@ -52,14 +53,20 @@ def convertir_pdfs(
     modo_ocr: str = "auto",
     idioma: str = "spa",
     sobrescribir: bool = False,
+    claves: list[str] | None = None,
 ) -> dict:
     """Convierte a Markdown los PDF de download/<prefijo>/<fecha>/ y los sube a markdown/.
 
-    `fecha` por defecto es la más reciente en download/; `ficheros` limita la conversión a esos
-    nombres de PDF. Devuelve un resumen con los convertidos, omitidos y fallos.
+    `fecha` por defecto es la más reciente en download/. Para no convertir toda la carpeta,
+    `ficheros` limita la conversión a esos nombres de PDF y `claves` a esas claves de S3
+    (la salida de la etapa 1); no se pueden usar los dos a la vez.
+    Devuelve un resumen con los convertidos, omitidos y fallos, y en `claves` los .md listos
+    (convertidos y omitidos), que es el evento de entrada de la etapa 3 (`extraer_kids`).
     """
     if modo_ocr not in MODOS_OCR:
         raise ValueError(f"modo de OCR no válido '{modo_ocr}', opciones: {', '.join(MODOS_OCR)}")
+    if ficheros and claves is not None:
+        raise ValueError("indica 'ficheros' o 'claves', no los dos")
 
     s3 = alm.conectar(bucket)
     fecha = alm.resolver_fecha(s3, bucket, alm.CARPETA_DESCARGA, prefijo, fecha)
@@ -68,26 +75,31 @@ def convertir_pdfs(
     print(f"Origen:  s3://{bucket}/{origen}/")
     print(f"Destino: s3://{bucket}/{destino}/\n")
 
-    claves = alm.listar_claves(s3, bucket, origen, ".pdf")
-    if ficheros:
-        pedidos = set(ficheros)
-        claves = [c for c in claves if PurePosixPath(c).name in pedidos]
-        for falta in sorted(pedidos - {PurePosixPath(c).name for c in claves}):
+    claves_pdf = alm.listar_claves(s3, bucket, origen, ".pdf")
+    if claves is not None:
+        pedidas = set(claves)
+        claves_pdf = [c for c in claves_pdf if c in pedidas]
+        for falta in sorted(pedidas - set(claves_pdf)):
             print(f"AVISO: no existe '{falta}' en s3://{bucket}/{origen}/")
-    if not claves:
-        raise alm.ErrorEtapa(f"no se ha encontrado ningún PDF en s3://{bucket}/{origen}/")
+    elif ficheros:
+        pedidos = set(ficheros)
+        claves_pdf = [c for c in claves_pdf if PurePosixPath(c).name in pedidos]
+        for falta in sorted(pedidos - {PurePosixPath(c).name for c in claves_pdf}):
+            print(f"AVISO: no existe '{falta}' en s3://{bucket}/{origen}/")
+    if not claves_pdf:
+        raise alm.ErrorEtapa(f"no se ha encontrado ningún PDF que convertir en s3://{bucket}/{origen}/")
 
     ya_existentes = set() if sobrescribir else set(alm.listar_claves(s3, bucket, destino, ".md"))
 
     convertidos, omitidos, fallos = [], [], []
-    for i, clave_pdf in enumerate(claves, 1):
+    for i, clave_pdf in enumerate(claves_pdf, 1):
         nombre = PurePosixPath(clave_pdf).name
         clave_md = f"{destino}/{PurePosixPath(clave_pdf).stem}.md"
         if clave_md in ya_existentes:
-            print(f"[{i}/{len(claves)}] {nombre}: ya existe el .md, se omite")
+            print(f"[{i}/{len(claves_pdf)}] {nombre}: ya existe el .md, se omite")
             omitidos.append(clave_md)
             continue
-        print(f"[{i}/{len(claves)}] {nombre} -> s3://{bucket}/{clave_md}")
+        print(f"[{i}/{len(claves_pdf)}] {nombre} -> s3://{bucket}/{clave_md}")
         try:
             markdown = pdf_a_markdown(alm.leer(s3, bucket, clave_pdf), modo_ocr, idioma)
             alm.escribir(
@@ -107,7 +119,8 @@ def convertir_pdfs(
     for fallo in fallos:
         print(f"    - {fallo['fichero']}: {fallo['error']}")
     return {
-        "bucket": bucket, "origen": origen, "destino": destino, "fecha": fecha,
+        "bucket": bucket, "prefijo": prefijo, "fecha": fecha, "origen": origen, "destino": destino,
+        "claves": sorted(convertidos + omitidos),
         "convertidos": convertidos, "omitidos": omitidos, "fallos": fallos,
     }
 
@@ -117,6 +130,10 @@ def main() -> int:
     parser.add_argument(
         "ficheros", nargs="*",
         help="Nombres de PDF de la carpeta a convertir (por defecto, todos)",
+    )
+    parser.add_argument(
+        "--claves", nargs="+",
+        help="Claves de S3 de los PDF a convertir (alternativa a los nombres de fichero)",
     )
     parser.add_argument("--bucket", default=alm.BUCKET_POR_DEFECTO, help="Bucket de S3")
     parser.add_argument("--prefijo", default=alm.PREFIJO_POR_DEFECTO, help="Gestora (carpeta dentro de cada etapa)")
@@ -130,10 +147,13 @@ def main() -> int:
         "--sobrescribir", action="store_true", help="Regenera los .md aunque ya existan"
     )
     args = parser.parse_args()
+    if args.ficheros and args.claves:
+        parser.error("indica nombres de fichero o --claves, no los dos")
 
     try:
         resumen = convertir_pdfs(
-            args.bucket, args.prefijo, args.fecha, args.ficheros, args.ocr, args.idioma, args.sobrescribir
+            args.bucket, args.prefijo, args.fecha, args.ficheros, args.ocr, args.idioma, args.sobrescribir,
+            args.claves,
         )
     except alm.ErrorEtapa as e:
         print(f"[error] {e}")

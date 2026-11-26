@@ -5,6 +5,10 @@ Estructura del bucket (misma ruta <gestora>/<AAAAMMDD>/<slug>_<tipo> en cada eta
     download/<gestora>/<AAAAMMDD>/<slug>_<tipo>.pdf     etapa 1: PDF descargados
     markdown/<gestora>/<AAAAMMDD>/<slug>_<tipo>.md      etapa 2: PDF convertidos a Markdown
     extraction/<gestora>/<AAAAMMDD>/<slug>_<tipo>.json  etapa 3: datos extraídos
+
+Encadenamiento: cada etapa devuelve un resumen con `bucket`, `prefijo`, `fecha`, `claves`
+(claves de S3 que ha dejado listas) y `fallos`. Ese resumen es un evento válido para la etapa
+siguiente, que procesa solo esas `claves`.
 """
 
 import argparse
@@ -27,6 +31,19 @@ class ErrorEtapa(RuntimeError):
 
     Los scripts lo muestran y terminan con código 1; en Lambda hace fallar la invocación.
     """
+
+
+def evento_lambda(event) -> dict:
+    """Parámetros de entrada de un handler a partir del evento de Lambda.
+
+    Las etapas se encadenan pasando la salida de una como evento de la siguiente. El evento
+    puede llegar tal cual (invocación directa o Step Functions) o dentro del sobre de Lambda
+    Destinations ({"requestPayload": ..., "responsePayload": <salida de la etapa anterior>}).
+    """
+    event = event or {}
+    if isinstance(event.get("responsePayload"), dict):
+        return event["responsePayload"]
+    return event
 
 
 def comprobar_fecha(texto: str) -> str:

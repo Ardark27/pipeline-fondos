@@ -4,8 +4,14 @@ Evento (todas las claves son opcionales):
     {"bucket": "curso-miax-pipeline-fondos", "prefijo": "bestinver", "fecha": "AAAAMMDD",
      "ficheros": ["bestinfond_datos_fundamentales.pdf"], "ocr": "auto", "idioma": "spa",
      "sobrescribir": false}
+    o, en lugar de "ficheros", "claves": ["download/<prefijo>/<fecha>/<slug>_<tipo>.pdf", ...].
 
-Devuelve el resumen de `convertir_pdfs` (convertidos, omitidos y fallos).
+La salida de la etapa 1 es un evento válido: se convierten solo los PDF de su "claves".
+
+Devuelve el resumen de `convertir_pdfs`, que es el evento de entrada de la etapa 3:
+    {"bucket": ..., "prefijo": ..., "fecha": ..., "origen": ..., "destino": ...,
+     "claves": ["markdown/<prefijo>/<fecha>/<slug>_<tipo>.md", ...],
+     "convertidos": [...], "omitidos": [...], "fallos": [...]}
 """
 
 from common import almacenamiento_s3 as alm
@@ -13,7 +19,7 @@ from pdf_a_markdown import convertir_pdfs
 
 
 def handler(event, context):
-    event = event or {}
+    event = alm.evento_lambda(event)
     return convertir_pdfs(
         bucket=event.get("bucket", alm.BUCKET_POR_DEFECTO),
         prefijo=event.get("prefijo", alm.PREFIJO_POR_DEFECTO),
@@ -22,4 +28,5 @@ def handler(event, context):
         modo_ocr=event.get("ocr", "auto"),
         idioma=event.get("idioma", "spa"),
         sobrescribir=bool(event.get("sobrescribir", False)),
+        claves=event.get("claves"),
     )

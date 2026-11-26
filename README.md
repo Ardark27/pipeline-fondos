@@ -127,6 +127,7 @@ Lee los PDF de `download/<gestora>/<AAAAMMDD>/` y sube cada `<slug>_<tipo>.pdf` 
 python pdf_markdown/pdf_a_markdown.py                                  # todos los PDF de la última fecha de download/bestinver/
 python pdf_markdown/pdf_a_markdown.py --fecha 20261119                 # una fecha concreta
 python pdf_markdown/pdf_a_markdown.py bestinfond_datos_fundamentales.pdf   # solo esos ficheros de la carpeta
+python pdf_markdown/pdf_a_markdown.py --claves download/bestinver/20261119/bestinfond_ficha_fondo.pdf  # por clave de S3
 python pdf_markdown/pdf_a_markdown.py --prefijo otra-gestora --bucket otro-bucket
 python pdf_markdown/pdf_a_markdown.py --ocr siempre                    # auto (por defecto) | siempre | nunca
 python pdf_markdown/pdf_a_markdown.py --sobrescribir                   # regenera los .md que ya existan en S3
@@ -145,6 +146,7 @@ python structured_output/extractor_kid.py                              # KID de 
 python structured_output/extractor_kid.py bestinver-renta bestvalue    # KID de esos fondos (slugs)
 python structured_output/extractor_kid.py --todos                      # todos los *_datos_fundamentales.md de la carpeta
 python structured_output/extractor_kid.py --fecha 20261119             # una fecha concreta
+python structured_output/extractor_kid.py --claves markdown/bestinver/20261119/bestinfond_datos_fundamentales.md
 ```
 
 Admite también `--bucket` y `--prefijo`. Formato del JSON:
@@ -178,9 +180,9 @@ Cada script separa la lógica de la etapa en una función con parámetros normal
 
 | Etapa | Función | Claves del evento (todas opcionales) |
 |---|---|---|
-| 1 | `descargar_documentos(bucket, prefijo, fecha, delay)` | `bucket`, `prefijo`, `fecha` (por defecto hoy), `delay` |
-| 2 | `convertir_pdfs(bucket, prefijo, fecha, ficheros, modo_ocr, idioma, sobrescribir)` | `bucket`, `prefijo`, `fecha`, `ficheros`, `ocr`, `idioma`, `sobrescribir` |
-| 3 | `extraer_kids(bucket, prefijo, fecha, fondos, todos)` | `bucket`, `prefijo`, `fecha`, `fondos`, `todos` |
+| 1 | `descargar_documentos(bucket, prefijo, fecha, delay)` | `bucket`, `prefijo`, `fecha` (por defecto, el día de `time` o hoy), `delay`, `time` (hora programada del scheduler) |
+| 2 | `convertir_pdfs(bucket, prefijo, fecha, ficheros, modo_ocr, idioma, sobrescribir, claves)` | `bucket`, `prefijo`, `fecha`, `ficheros` o `claves`, `ocr`, `idioma`, `sobrescribir` |
+| 3 | `extraer_kids(bucket, prefijo, fecha, fondos, todos, claves)` | `bucket`, `prefijo`, `fecha`, `fondos`/`todos` o `claves` |
 
 Los valores por defecto son los mismos que en la línea de comandos. Ejemplos:
 
@@ -191,7 +193,36 @@ Los valores por defecto son los mismos que en la línea de comandos. Ejemplos:
 {"todos": true}                                                          // etapa 3: o "fondos": ["bestinver-renta"]
 ```
 
-La Lambda devuelve el resumen que devuelve la función: carpetas, fecha usada, claves de S3 generadas (`subidos` / `convertidos` y `omitidos` / `extraidos`) y `fallos`. Los fallos de documentos sueltos no hacen fallar la invocación (el detalle queda en el resumen y en CloudWatch Logs). Un error que impide ejecutar la etapa sí la hace fallar: `ErrorEtapa` (bucket inaccesible, no hay carpeta de fecha o nada que procesar) o `ValueError` (fecha o modo de OCR no válidos). Por consola, esos mismos errores se muestran y el script termina con código 1.
+La Lambda devuelve el resumen que devuelve la función. Todas las etapas comparten estas claves (más detalle propio, como `convertidos` y `omitidos` en la etapa 2):
+
+```jsonc
+{"bucket": "curso-miax-pipeline-fondos", "prefijo": "bestinver", "fecha": "20261119",
+ "claves": ["download/bestinver/20261119/bestinfond_datos_fundamentales.pdf", "..."],  // lo que deja listo la etapa
+ "fallos": []}
+```
+
+### Ejecución programada (EventBridge Scheduler)
+
+La etapa 1 está pensada para lanzarse con un horario. Se crea un schedule en **EventBridge Scheduler** (p. ej. `cron(0 6 * * ? *)`, zona horaria `Europe/Madrid`) con destino la Lambda `pipeline-fondos-descarga` (o la máquina de Step Functions de abajo) y este **Input**:
+
+```json
+{"time": "<aws.scheduler.scheduled-time>", "prefijo": "bestinver", "delay": 1.0}
+```
+
+Scheduler sustituye `<aws.scheduler.scheduled-time>` por la hora programada (ISO 8601 en UTC) y el handler toma la carpeta de fecha del **día UTC de esa hora**, no del reloj: si el scheduler reintenta la invocación, escribe en la misma carpeta. Si el evento trae `fecha`, manda `fecha`. El rol de ejecución del schedule necesita `lambda:InvokeFunction` sobre la función (o `states:StartExecution` si el destino es Step Functions).
+
+También se acepta el evento de una regla programada de EventBridge (`"detail-type": "Scheduled Event"`, con `time`): sus parámetros, si los hay, van en `detail`.
+
+### Encadenamiento de etapas
+
+La salida de cada etapa es un evento válido para la siguiente: con `claves`, la etapa 2 convierte solo los PDF que acaba de subir la etapa 1 (no toda la carpeta) y la etapa 3 extrae solo los KID de los `.md` de la etapa 2 (convertidos y omitidos; las fichas se ignoran). `claves` no se combina con `ficheros` (etapa 2) ni con `fondos`/`todos` (etapa 3). Si `claves` llega vacía, la etapa falla con `ErrorEtapa` (no hay nada que procesar). Los handlers aceptan el evento directo (invocación manual o Step Functions) o el sobre de Lambda Destinations (`{"responsePayload": ...}`), con `alm.evento_lambda`.
+
+Para encadenarlas en AWS hay dos opciones:
+
+- **Step Functions** (recomendada): una máquina de estados con tres tareas `arn:aws:states:::lambda:invoke` en serie, cada una con `OutputPath: "$.Payload"` (o `"Output": "{% $states.result.Payload %}"` en JSONata) para pasar solo el resumen a la siguiente. Permite reintentos, ver cada ejecución y lanzarla con un horario de EventBridge Scheduler.
+- **Lambda Destinations**: en la función de la etapa 1, destino *On success* = función de la etapa 2; en la de la etapa 2, *On success* = etapa 3. Solo funciona con invocaciones asíncronas (`--invocation-type Event` o EventBridge), y cada rol necesita `lambda:InvokeFunction` sobre la función siguiente.
+
+Los fallos de documentos sueltos no hacen fallar la invocación (el detalle queda en el resumen y en CloudWatch Logs). Un error que impide ejecutar la etapa sí la hace fallar: `ErrorEtapa` (bucket inaccesible, no hay carpeta de fecha o nada que procesar) o `ValueError` (fecha o modo de OCR no válidos). Por consola, esos mismos errores se muestran y el script termina con código 1.
 
 ### Despliegue (GitHub Actions)
 

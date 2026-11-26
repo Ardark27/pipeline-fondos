@@ -130,7 +130,8 @@ def descargar_documentos(
     """Descarga los documentos de todos los fondos y los sube a S3.
 
     `fecha` (AAAAMMDD) es la subcarpeta de destino; por defecto, hoy.
-    Devuelve un resumen con la carpeta de destino, las claves subidas y los fallos.
+    Devuelve un resumen con la carpeta de destino, las claves subidas (`claves`) y los fallos;
+    es el evento de entrada de la etapa 2 (`convertir_pdfs`).
     """
     fecha = alm.comprobar_fecha(fecha) if fecha else date.today().strftime("%Y%m%d")
     carpeta_s3 = alm.carpeta(alm.CARPETA_DESCARGA, prefijo, fecha)
@@ -180,7 +181,10 @@ def descargar_documentos(
         print(f"Fallos ({len(fallos)}):")
         for fallo in fallos:
             print(f"  - {fallo['fondo']}: {fallo['detalle']}")
-    return {"bucket": bucket, "carpeta": carpeta_s3, "fecha": fecha, "subidos": subidos, "fallos": fallos}
+    return {
+        "bucket": bucket, "prefijo": prefijo, "fecha": fecha, "carpeta": carpeta_s3,
+        "claves": subidos, "fallos": fallos,
+    }
 
 
 def main() -> int:
