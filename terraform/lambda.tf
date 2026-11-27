@@ -1,10 +1,4 @@
-# Funciones Lambda de cada etapa (imagen Docker). Ya existían: se importan.
-import {
-  for_each = local.etapas
-  to       = aws_lambda_function.etapa[each.key]
-  id       = each.value.funcion
-}
-
+# Funciones Lambda de cada etapa (imagen Docker).
 resource "aws_lambda_function" "etapa" {
   for_each = local.etapas
 
@@ -28,13 +22,7 @@ resource "aws_lambda_function" "etapa" {
   ]
 }
 
-# Grupos de logs (los creó Lambda automáticamente): se importan para fijar la retención
-import {
-  for_each = local.etapas
-  to       = aws_cloudwatch_log_group.etapa[each.key]
-  id       = "/aws/lambda/${each.value.funcion}"
-}
-
+# Grupos de logs de las Lambdas, con retención fija
 resource "aws_cloudwatch_log_group" "etapa" {
   for_each = local.etapas
 

@@ -249,7 +249,7 @@ Toda la infraestructura de AWS (región `eu-west-3`) se define con Terraform en 
 | `despliegue.tf` | Política `pipeline-fondos-despliegue`, asociada al rol `miax-github-deploy` de GitHub Actions, con los permisos para aplicar este Terraform. |
 | `variables.tf`, `outputs.tf` | Variables (región, bucket, programación, paralelismo de la etapa 2, retención de logs...) y salidas. |
 
-El bucket, los repositorios ECR, las Lambdas, sus grupos de logs y el schedule ya existían: se incorporan al estado con bloques `import` la primera vez que se aplica. El proveedor OIDC de GitHub y el rol `miax-github-deploy` se crean fuera de este proyecto (los usan otros repositorios); Terraform solo le asocia la política de despliegue.
+El bucket, los repositorios ECR, las Lambdas, sus grupos de logs y el schedule se crearon antes a mano y se importaron al estado de Terraform. El proveedor OIDC de GitHub y el rol `miax-github-deploy` se crean fuera de este proyecto (los usan otros repositorios); Terraform solo le asocia la política de despliegue.
 
 Memoria y timeout de cada Lambda: descarga 256 MB y 5 min; Markdown 3008 MB y 15 min (por invocación se convierte un PDF); extracción 512 MB y 15 min.
 
@@ -269,7 +269,7 @@ terraform plan
 terraform apply
 ```
 
-**La primera vez hay que aplicarlo en local**, antes del primer push con el nuevo workflow: importa los recursos existentes y da al rol `miax-github-deploy` los permisos que necesita el workflow (sin ellos no puede leer el estado ni gestionar IAM). Los roles creados a mano antes de Terraform (`pipeline-fondos-*-role-*` en `service-role/` y `Amazon_EventBridge_Scheduler_LAMBDA_8f53be9dfd`) dejan de usarse y se pueden borrar desde la consola de IAM.
+La política `pipeline-fondos-despliegue` (que da al rol `miax-github-deploy` permisos para leer el estado y gestionar IAM) se creó con un primer `apply` en local; si se cambian sus permisos y el workflow deja de tenerlos, hay que volver a aplicarla en local.
 
 Si se aplica en local con una etiqueta cuya imagen aún no está en ECR, la actualización de la Lambda falla: en ese caso hay que hacer push y dejar que el workflow construya la imagen.
 

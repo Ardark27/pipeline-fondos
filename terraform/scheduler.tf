@@ -1,10 +1,4 @@
-# Programación del pipeline completo con EventBridge Scheduler. El schedule ya existía (apuntando
-# a la Lambda de la etapa 1): se importa y ahora lanza la máquina de estados.
-import {
-  to = aws_scheduler_schedule.pipeline
-  id = "default/descarga-bestinver-fondos"
-}
-
+# Programación del pipeline completo con EventBridge Scheduler: lanza la máquina de estados.
 resource "aws_scheduler_schedule" "pipeline" {
   name                         = "descarga-bestinver-fondos"
   group_name                   = "default"

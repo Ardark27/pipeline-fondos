@@ -1,9 +1,4 @@
-# Bucket de datos del pipeline. Ya existía: se importa en lugar de crearse.
-import {
-  to = aws_s3_bucket.datos
-  id = var.bucket
-}
-
+# Bucket de datos del pipeline.
 resource "aws_s3_bucket" "datos" {
   bucket = var.bucket
 
@@ -11,11 +6,6 @@ resource "aws_s3_bucket" "datos" {
   lifecycle {
     prevent_destroy = true
   }
-}
-
-import {
-  to = aws_s3_bucket_public_access_block.datos
-  id = var.bucket
 }
 
 resource "aws_s3_bucket_public_access_block" "datos" {

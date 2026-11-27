@@ -1,10 +1,4 @@
-# Un repositorio de ECR por etapa. Ya existían: se importan.
-import {
-  for_each = local.etapas
-  to       = aws_ecr_repository.etapa[each.key]
-  id       = each.value.repositorio
-}
-
+# Un repositorio de ECR por etapa.
 resource "aws_ecr_repository" "etapa" {
   for_each = local.etapas
 
