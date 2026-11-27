@@ -1,0 +1,147 @@
+name: Deploy
+
+# Toda la infraestructura se gestiona con Terraform (carpeta terraform/).
+#
+# 1. preparar:  crea/actualiza los repositorios de ECR y calcula la etiqueta de imagen de cada
+#               etapa (SHA del último commit que cambió su carpeta o common/). Las etapas cuya
+#               imagen con esa etiqueta todavía no está en ECR son las que hay que construir.
+# 2. construir: construye y sube a ECR solo esas imágenes (en paralelo).
+# 3. aplicar:   terraform apply de todo. Solo cambian las Lambdas cuya etiqueta ha cambiado y
+#               cualquier otro recurso modificado en terraform/.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: eu-west-3
+  TERRAFORM_VERSION: "1.17.2"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+permissions:
+  id-token: write   # necesario para OIDC
+  contents: read
+
+# Nunca dos ejecuciones de Terraform a la vez sobre el mismo estado
+concurrency:
+  group: terraform-pipeline-fondos
+  cancel-in-progress: false
+
+jobs:
+  preparar:
+    name: Preparar repositorios e imágenes
+    runs-on: ubuntu-latest
+    outputs:
+      matriz: ${{ steps.imagenes.outputs.matriz }}
+      hay_imagenes: ${{ steps.imagenes.outputs.hay_imagenes }}
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # historial completo para calcular la etiqueta de cada etapa
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::823028065899:role/miax-github-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false   # para leer la salida de terraform output -json
+
+      - name: Etiquetas de imagen
+        run: |
+          bash etiquetas_imagen.sh > imagenes.auto.tfvars.json
+          cat imagenes.auto.tfvars.json
+
+      - run: terraform init
+
+      - name: Repositorios de ECR
+        # Antes de construir las imágenes tiene que existir su repositorio (p. ej. en una etapa nueva)
+        run: terraform apply -auto-approve -target=aws_ecr_repository.etapa
+
+      - id: imagenes
+        name: Imágenes que hay que construir
+        run: |
+          repositorios=$(terraform output -json repositorios)
+          matriz='[]'
+          for etapa in $(jq -r '.etiquetas_imagen | keys[]' imagenes.auto.tfvars.json); do
+            etiqueta=$(jq -r --arg e "$etapa" '.etiquetas_imagen[$e]' imagenes.auto.tfvars.json)
+            url=$(jq -r --arg e "$etapa" '.[$e]' <<< "$repositorios")
+            if aws ecr describe-images --repository-name "${url#*/}" --image-ids imageTag="$etiqueta" > /dev/null 2>&1; then
+              echo "$etapa: la imagen $etiqueta ya está en ECR."
+            else
+              echo "$etapa: se construye la imagen $etiqueta."
+              matriz=$(jq -c --arg e "$etapa" --arg i "$url:$etiqueta" '. + [{etapa: $e, imagen: $i}]' <<< "$matriz")
+            fi
+          done
+          echo "matriz=$matriz" >> "$GITHUB_OUTPUT"
+          echo "hay_imagenes=$(jq 'length > 0' <<< "$matriz")" >> "$GITHUB_OUTPUT"
+
+  construir:
+    name: Construir ${{ matrix.etapa }}
+    needs: preparar
+    if: needs.preparar.outputs.hay_imagenes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false   # si falla una imagen, las demás se suben igualmente (y la próxima vez no se repiten)
+      matrix:
+        include: ${{ fromJSON(needs.preparar.outputs.matriz) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::823028065899:role/miax-github-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push
+        env:
+          ETAPA: ${{ matrix.etapa }}
+          IMAGEN: ${{ matrix.imagen }}
+        run: |
+          # El contexto es la raíz del repo para poder copiar common/ en la imagen
+          docker build --platform linux/amd64 --provenance=false -f "$ETAPA/Dockerfile" -t "$IMAGEN" .
+          docker push "$IMAGEN"
+
+  aplicar:
+    name: Terraform apply
+    needs: [preparar, construir]
+    # Se ejecuta aunque no haya imágenes que construir, pero no si ha fallado alguna
+    if: >-
+      always() && needs.preparar.result == 'success' &&
+      (needs.construir.result == 'success' || needs.construir.result == 'skipped')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::823028065899:role/miax-github-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Etiquetas de imagen
+        run: bash etiquetas_imagen.sh > imagenes.auto.tfvars.json
+
+      - run: terraform init
+
+      - run: terraform plan -out=despliegue.tfplan
+
+      - run: terraform apply -auto-approve despliegue.tfplan

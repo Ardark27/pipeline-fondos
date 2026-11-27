@@ -224,3 +224,10 @@ __marimo__/
 
 # PDFs descargados
 descargas/
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfplan
+terraform/imagenes.auto.tfvars.json

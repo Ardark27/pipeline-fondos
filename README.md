@@ -29,6 +29,8 @@ common/almacenamiento_s3.py          # código compartido: rutas del bucket y le
 webscrapper/descargar_kids_bestinver.py   # etapa 1: descarga
 pdf_markdown/pdf_a_markdown.py       # etapa 2: PDF -> Markdown
 structured_output/extractor_kid.py   # etapa 3: extracción del KID
+terraform/                           # infraestructura de AWS (S3, ECR, Lambda, Step Functions, Scheduler, IAM)
+.github/workflows/deploy.yaml        # despliegue: imágenes a ECR + terraform apply
 ```
 
 Todas las etapas importan `common` (cada script añade la raíz del repo al `sys.path`, así que se pueden ejecutar directamente con `python <carpeta>/<script>.py`).
@@ -162,7 +164,7 @@ Admite también `--bucket` y `--prefijo`. Formato del JSON:
 
 ## Ejecución en AWS Lambda
 
-Cada etapa se empaqueta en su propia imagen Docker (basada en `dockerfile_template`) y se despliega como una función Lambda:
+Cada etapa se empaqueta en su propia imagen Docker y se despliega como una función Lambda (la infraestructura se gestiona con Terraform, ver [Infraestructura](#infraestructura-terraform)):
 
 | Etapa | Dockerfile | Función Lambda | Imagen en ECR (`823028065899.dkr.ecr.eu-west-3.amazonaws.com/...`) |
 |---|---|---|---|
@@ -203,45 +205,85 @@ La Lambda devuelve el resumen que devuelve la función. Todas las etapas compart
 
 ### Ejecución programada (EventBridge Scheduler)
 
-La etapa 1 está pensada para lanzarse con un horario. Se crea un schedule en **EventBridge Scheduler** (p. ej. `cron(0 6 * * ? *)`, zona horaria `Europe/Madrid`) con destino la Lambda `pipeline-fondos-descarga` (o la máquina de Step Functions de abajo) y este **Input**:
+El schedule `descarga-bestinver-fondos` de **EventBridge Scheduler** (`cron(0 9 15 * ? *)`, zona horaria `Europe/Madrid`: el día 15 de cada mes a las 9:00) lanza la máquina de Step Functions `pipeline-fondos` (abajo) con este **Input**:
 
 ```json
-{"time": "<aws.scheduler.scheduled-time>", "prefijo": "bestinver", "delay": 1.0}
+{"time": "<aws.scheduler.scheduled-time>", "prefijo": "bestinver"}
 ```
 
-Scheduler sustituye `<aws.scheduler.scheduled-time>` por la hora programada (ISO 8601 en UTC) y el handler toma la carpeta de fecha del **día UTC de esa hora**, no del reloj: si el scheduler reintenta la invocación, escribe en la misma carpeta. Si el evento trae `fecha`, manda `fecha`. El rol de ejecución del schedule necesita `lambda:InvokeFunction` sobre la función (o `states:StartExecution` si el destino es Step Functions).
+Scheduler sustituye `<aws.scheduler.scheduled-time>` por la hora programada (ISO 8601 en UTC) y el handler de la etapa 1 toma la carpeta de fecha del **día UTC de esa hora**, no del reloj: si el scheduler reintenta, escribe en la misma carpeta. Si el evento trae `fecha`, manda `fecha`. La expresión, la zona horaria y la gestora son variables de Terraform (`programacion`, `zona_horaria`, `gestora`).
 
-También se acepta el evento de una regla programada de EventBridge (`"detail-type": "Scheduled Event"`, con `time`): sus parámetros, si los hay, van en `detail`.
+El handler de la etapa 1 también acepta el evento de una regla programada de EventBridge (`"detail-type": "Scheduled Event"`, con `time`): sus parámetros, si los hay, van en `detail`.
 
 ### Encadenamiento de etapas
 
 La salida de cada etapa es un evento válido para la siguiente: con `claves`, la etapa 2 convierte solo los PDF que acaba de subir la etapa 1 (no toda la carpeta) y la etapa 3 extrae solo los KID de los `.md` de la etapa 2 (convertidos y omitidos; las fichas se ignoran). `claves` no se combina con `ficheros` (etapa 2) ni con `fondos`/`todos` (etapa 3). Si `claves` llega vacía, la etapa falla con `ErrorEtapa` (no hay nada que procesar). Los handlers aceptan el evento directo (invocación manual o Step Functions) o el sobre de Lambda Destinations (`{"responsePayload": ...}`), con `alm.evento_lambda`.
 
-Para encadenarlas en AWS hay dos opciones:
+En AWS las encadena la máquina de estados **`pipeline-fondos`** (Step Functions con JSONata, definida en [`terraform/step_functions.tf`](terraform/step_functions.tf)):
 
-- **Step Functions** (recomendada): una máquina de estados con tres tareas `arn:aws:states:::lambda:invoke` en serie, cada una con `OutputPath: "$.Payload"` (o `"Output": "{% $states.result.Payload %}"` en JSONata) para pasar solo el resumen a la siguiente. Permite reintentos, ver cada ejecución y lanzarla con un horario de EventBridge Scheduler.
-- **Lambda Destinations**: en la función de la etapa 1, destino *On success* = función de la etapa 2; en la de la etapa 2, *On success* = etapa 3. Solo funciona con invocaciones asíncronas (`--invocation-type Event` o EventBridge), y cada rol necesita `lambda:InvokeFunction` sobre la función siguiente.
+```
+Descarga ──> Markdown (Map: una invocación por PDF, hasta 5 a la vez) ──> Extraccion
+```
+
+- `Descarga` invoca la etapa 1 con la entrada de la ejecución.
+- `Markdown` recorre las `claves` de la etapa 1 e invoca la etapa 2 con **un PDF por invocación** (así ninguna se acerca al límite de 15 minutos de Lambda por el OCR). Después junta las `claves` y los `fallos` de todas en un único evento.
+- `Extraccion` invoca la etapa 3 con ese evento.
+
+Cada tarea reintenta los errores transitorios del servicio Lambda; un `ErrorEtapa` o cualquier otro error del código hace fallar la ejecución. Para lanzarla a mano: consola de Step Functions → *Start execution* con, por ejemplo, `{"fecha": "20261119", "prefijo": "bestinver"}`.
 
 Los fallos de documentos sueltos no hacen fallar la invocación (el detalle queda en el resumen y en CloudWatch Logs). Un error que impide ejecutar la etapa sí la hace fallar: `ErrorEtapa` (bucket inaccesible, no hay carpeta de fecha o nada que procesar) o `ValueError` (fecha o modo de OCR no válidos). Por consola, esos mismos errores se muestran y el script termina con código 1.
 
+## Infraestructura (Terraform)
+
+Toda la infraestructura de AWS (región `eu-west-3`) se define con Terraform en [`terraform/`](terraform/). El estado está en S3 (`s3://miax-adrian-pascua-wrkogph098767812/pipeline-fondos/terraform.tfstate`, con bloqueo por fichero `.tflock`).
+
+| Fichero | Recursos |
+|---|---|
+| `etapas.tf` | Lista de etapas: carpeta, repositorio ECR, función Lambda, memoria, timeout y carpetas del bucket que lee y escribe. |
+| `s3.tf` | Bucket `curso-miax-pipeline-fondos` (con `prevent_destroy`) y su bloqueo de acceso público. |
+| `ecr.tf` | Un repositorio ECR por etapa, con política de ciclo de vida (se conservan las 10 últimas imágenes). |
+| `lambda.tf` | Las tres funciones Lambda de tipo imagen y sus grupos de logs (retención de 30 días). |
+| `iam.tf` | Un rol por Lambda con permisos mínimos: `s3:ListBucket` en el bucket, lectura de la carpeta de la etapa anterior, lectura/escritura de la suya y, en la etapa 3, `bedrock:InvokeModel`. |
+| `step_functions.tf` | Máquina de estados `pipeline-fondos` y su rol. |
+| `scheduler.tf` | Schedule mensual que lanza la máquina de estados, y su rol. |
+| `despliegue.tf` | Política `pipeline-fondos-despliegue`, asociada al rol `miax-github-deploy` de GitHub Actions, con los permisos para aplicar este Terraform. |
+| `variables.tf`, `outputs.tf` | Variables (región, bucket, programación, paralelismo de la etapa 2, retención de logs...) y salidas. |
+
+El bucket, los repositorios ECR, las Lambdas, sus grupos de logs y el schedule ya existían: se incorporan al estado con bloques `import` la primera vez que se aplica. El proveedor OIDC de GitHub y el rol `miax-github-deploy` se crean fuera de este proyecto (los usan otros repositorios); Terraform solo le asocia la política de despliegue.
+
+Memoria y timeout de cada Lambda: descarga 256 MB y 5 min; Markdown 3008 MB y 15 min (por invocación se convierte un PDF); extracción 512 MB y 15 min.
+
+### Etiquetas de imagen
+
+Cada imagen se etiqueta con el **SHA del último commit que cambió la carpeta de la etapa o `common/`**. Lo calcula [`terraform/etiquetas_imagen.sh`](terraform/etiquetas_imagen.sh), que genera la variable `etiquetas_imagen` en `terraform/imagenes.auto.tfvars.json` (no se versiona). Así, si solo cambia `pdf_markdown/`, solo cambia la etiqueta de esa etapa y Terraform solo actualiza esa Lambda; un cambio en `common/` cambia las tres. Solo cuenta lo que está commiteado.
+
+### Uso en local
+
+Desde Git Bash, con credenciales de AWS con permisos de administrador:
+
+```bash
+bash terraform/etiquetas_imagen.sh > terraform/imagenes.auto.tfvars.json
+cd terraform
+terraform init
+terraform plan
+terraform apply
+```
+
+**La primera vez hay que aplicarlo en local**, antes del primer push con el nuevo workflow: importa los recursos existentes y da al rol `miax-github-deploy` los permisos que necesita el workflow (sin ellos no puede leer el estado ni gestionar IAM). Los roles creados a mano antes de Terraform (`pipeline-fondos-*-role-*` en `service-role/` y `Amazon_EventBridge_Scheduler_LAMBDA_8f53be9dfd`) dejan de usarse y se pueden borrar desde la consola de IAM.
+
+Si se aplica en local con una etiqueta cuya imagen aún no está en ECR, la actualización de la Lambda falla: en ese caso hay que hacer push y dejar que el workflow construya la imagen.
+
 ### Despliegue (GitHub Actions)
 
-El workflow [`.github/workflows/deploy_lambda.yaml`](.github/workflows/deploy_lambda.yaml) se ejecuta en cada push a `main` (o a mano con *Run workflow*) y tiene dos jobs:
+El workflow [`.github/workflows/deploy.yaml`](.github/workflows/deploy.yaml) se ejecuta en cada push a `main` (o a mano con *Run workflow*) y no permite dos ejecuciones a la vez. Se autentica en AWS por OIDC con el rol `miax-github-deploy` y tiene tres jobs:
 
-1. **Detectar etapas cambiadas** (`cambios`): compara el commit anterior al push con el nuevo (`git diff --name-only`) y decide qué etapas desplegar:
-   - un cambio dentro de la carpeta de una etapa (`webscrapper/`, `pdf_markdown/`, `structured_output/`) despliega solo esa etapa; si cambian varias, se despliegan esas;
-   - un cambio en `common/` despliega **todas**, porque las tres imágenes lo incluyen;
-   - un cambio en otros ficheros (README, `CLAUDE.md`, `requirements.txt` de la raíz...) no despliega nada;
-   - si no hay con qué comparar (ejecución a mano, primer push o push forzado), se despliegan todas.
-2. **Deploy** (`deploy`): con una matriz con las etapas seleccionadas, construye cada imagen, la sube a ECR y actualiza el código de su Lambda. Si no hay etapas seleccionadas, no se ejecuta.
+1. **Preparar** (`preparar`): genera las etiquetas de imagen, aplica solo los repositorios de ECR (`terraform apply -target=aws_ecr_repository.etapa`, para que existan antes de subir imágenes) y comprueba qué etapas no tienen todavía en ECR la imagen con su etiqueta.
+2. **Construir** (`construir`): con una matriz con esas etapas, construye cada imagen (desde la raíz del repo, para poder copiar `common/`) y la sube a ECR. Si todas las imágenes ya existen, no se ejecuta.
+3. **Terraform apply** (`aplicar`): `terraform plan` y `apply` de toda la infraestructura. Solo se ejecuta si no ha fallado ninguna imagen.
 
-Se autentica en AWS por OIDC con el rol `miax-github-deploy`. La lista de etapas (carpeta, repositorio ECR y función Lambda) está en la variable `ETAPAS` del job `cambios`; una etapa nueva se añade ahí.
+Por tanto, un cambio en `terraform/` se aplica sin reconstruir imágenes; un cambio en la carpeta de una etapa reconstruye y despliega solo esa etapa; uno en `common/`, todas; y un cambio en otros ficheros (README, `CLAUDE.md`...) termina con un plan sin cambios.
 
-Requisitos en AWS (región `eu-west-3`), creados previamente:
-
-- Repositorios ECR `webscrapper-miax-14`, `pdf-to-markdown-miax-14` y `structured-output-miax-14` (uno por etapa; cada imagen se etiqueta con el SHA del commit).
-- Las tres funciones Lambda de tipo imagen, con un rol con permisos de S3 sobre el bucket (`s3:GetObject`, `s3:PutObject`, `s3:ListBucket`) y, en la etapa 3, `bedrock:InvokeModel`.
-- Timeout y memoria suficientes: la etapa 2 (OCR) es la más pesada; el máximo de Lambda son 15 minutos, así que con muchos PDF conviene lanzarla por `ficheros` o con varias invocaciones.
+Para añadir una etapa: su carpeta con `Dockerfile`, una entrada en `local.etapas` (`terraform/etapas.tf`) con la misma clave que la carpeta y, si se encadena, su estado en `terraform/step_functions.tf`.
 
 ## Próximas etapas
 
