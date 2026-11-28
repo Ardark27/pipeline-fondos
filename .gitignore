@@ -231,3 +231,4 @@ terraform/*.tfstate
 terraform/*.tfstate.*
 terraform/*.tfplan
 terraform/imagenes.auto.tfvars.json
+terraform/.terraform.lock.hcl
